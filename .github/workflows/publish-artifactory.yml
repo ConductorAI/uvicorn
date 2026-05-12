@@ -33,6 +33,13 @@ jobs:
       - name: Install dependencies
         run: scripts/install
 
+      - name: Stamp local version identifier
+        run: |
+          BASE=$(python -c "import re,pathlib; print(re.search(r'__version__ = \"([^\"]+)\"', pathlib.Path('uvicorn/__init__.py').read_text()).group(1))")
+          LOCAL="${BASE}+cai.${{ github.run_number }}"
+          echo "Building ${LOCAL}"
+          sed -i "s/__version__ = \"${BASE}\"/__version__ = \"${LOCAL}\"/" uvicorn/__init__.py
+
       - name: Build package
         run: |
           uv build
