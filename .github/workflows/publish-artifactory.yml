@@ -2,6 +2,14 @@ name: Publish to Artifactory
 
 on:
   workflow_dispatch:
+    inputs:
+      dry-run:
+        description: "Build only; skip Artifactory upload"
+        type: boolean
+        default: true
+  push:
+    paths:
+      - .github/workflows/publish-artifactory.yml
 
 jobs:
   publish-artifactory:
@@ -36,9 +44,11 @@ jobs:
           uv run twine check dist/*
 
       - name: Setup JFrog CLI (OIDC)
+        if: github.event_name == 'workflow_dispatch' && inputs.dry-run != true
         uses: jfrog/setup-jfrog-cli@v4
         with:
           oidc-provider-name: ${{ env.JF_OIDC_PROVIDER }}
 
       - name: Upload distributions to Artifactory
+        if: github.event_name == 'workflow_dispatch' && inputs.dry-run != true
         run: jf rt upload "dist/*" "${JF_PYPI_REPO}/" --flat=true
