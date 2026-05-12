@@ -48,6 +48,7 @@ jobs:
         uses: jfrog/setup-jfrog-cli@v4
         with:
           oidc-provider-name: ${{ env.JF_OIDC_PROVIDER }}
+          oidc-audience: github-actions
 
       - name: Upload distributions to Artifactory
         if: github.event_name == 'workflow_dispatch' && inputs.dry-run != true
