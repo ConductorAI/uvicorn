@@ -51,5 +51,5 @@ jobs:
           oidc-audience: github-actions
 
       - name: Upload distributions to Artifactory
-        if: github.event_name == 'workflow_dispatch' && inputs.dry-run != true
+        if: ${{ !inputs.dry-run }}
         run: jf rt upload "dist/*" "${JF_PYPI_REPO}/" --flat=true
