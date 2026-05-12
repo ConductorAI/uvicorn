@@ -44,7 +44,7 @@ jobs:
           uv run twine check dist/*
 
       - name: Setup JFrog CLI (OIDC)
-        if: github.event_name == 'workflow_dispatch' && inputs.dry-run != true
+        if: ${{ !inputs.dry-run }}
         uses: jfrog/setup-jfrog-cli@v4
         with:
           oidc-provider-name: ${{ env.JF_OIDC_PROVIDER }}
