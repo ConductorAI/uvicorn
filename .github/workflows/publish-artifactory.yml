@@ -19,11 +19,6 @@ jobs:
       id-token: write
       contents: read
 
-    env:
-      JF_URL: ${{ vars.JF_URL }}
-      JF_PYPI_REPO: ${{ vars.JF_PYPI_REPO }}
-      JF_OIDC_PROVIDER: ${{ vars.JF_OIDC_PROVIDER }}
-
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
@@ -46,10 +41,15 @@ jobs:
       - name: Setup JFrog CLI (OIDC)
         if: ${{ !inputs.dry-run }}
         uses: jfrog/setup-jfrog-cli@v4
+        env:
+          JF_URL: ${{ vars.JF_URL }}
         with:
-          oidc-provider-name: ${{ env.JF_OIDC_PROVIDER }}
+          oidc-provider-name: ${{ vars.JF_OIDC_PROVIDER }}
           oidc-audience: github-actions
 
       - name: Upload distributions to Artifactory
         if: ${{ !inputs.dry-run }}
-        run: jf rt upload "dist/*" "${JF_PYPI_REPO}/" --flat=true
+        run: |
+          jf rt upload \
+            "dist/(*)" \
+            "${{ vars.JF_PYPI_REPO }}/uvicorn/{1}"
