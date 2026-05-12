@@ -6,7 +6,7 @@ on:
       dry-run:
         description: "Build only; skip Artifactory upload"
         type: boolean
-        default: true
+        default: false
   push:
     paths:
       - .github/workflows/publish-artifactory.yml
