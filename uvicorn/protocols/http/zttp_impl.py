@@ -2,14 +2,12 @@ from __future__ import annotations
 
 import asyncio
 import contextvars
-import http
 import logging
 from collections.abc import Callable
 from typing import Any, Literal
 from urllib.parse import unquote
 
-import h11
-from h11._connection import DEFAULT_MAX_INCOMPLETE_EVENT_SIZE
+import zttp
 
 from uvicorn._types import (
     ASGI3Application,
@@ -22,22 +20,12 @@ from uvicorn._types import (
 )
 from uvicorn.config import Config
 from uvicorn.logging import TRACE_LOG_LEVEL
-from uvicorn.protocols.http.flow_control import CLOSE_HEADER, HIGH_WATER_LIMIT, FlowControl, service_unavailable
+from uvicorn.protocols.http.flow_control import HIGH_WATER_LIMIT, FlowControl, service_unavailable
 from uvicorn.protocols.utils import get_client_addr, get_local_addr, get_path_with_query_string, get_remote_addr, is_ssl
 from uvicorn.server import ServerState
 
 
-def _get_status_phrase(status_code: int) -> bytes:
-    try:
-        return http.HTTPStatus(status_code).phrase.encode()
-    except ValueError:
-        return b""
-
-
-STATUS_PHRASES = {status_code: _get_status_phrase(status_code) for status_code in range(100, 600)}
-
-
-class H11Protocol(asyncio.Protocol):
+class ZttpProtocol(asyncio.Protocol):
     def __init__(
         self,
         config: Config,
@@ -54,12 +42,7 @@ class H11Protocol(asyncio.Protocol):
         self.logger = logging.getLogger("uvicorn.error")
         self.access_logger = logging.getLogger("uvicorn.access")
         self.access_log = self.access_logger.hasHandlers()
-        self.conn = h11.Connection(
-            h11.SERVER,
-            config.h11_max_incomplete_event_size
-            if config.h11_max_incomplete_event_size is not None
-            else DEFAULT_MAX_INCOMPLETE_EVENT_SIZE,
-        )
+        self.conn = zttp.Connection(zttp.SERVER)
         self.ws_protocol_class = config.ws_protocol_class
         self.root_path = config.root_path
         self.asgi_version = config.asgi_version
@@ -112,14 +95,6 @@ class H11Protocol(asyncio.Protocol):
 
         if self.cycle and not self.cycle.response_complete:
             self.cycle.disconnected = True
-        if self.conn.our_state != h11.ERROR:
-            event = h11.ConnectionClosed()
-            try:
-                self.conn.send(event)
-            except h11.LocalProtocolError:
-                # Premature client disconnect
-                pass
-
         if self.cycle is not None:
             self.cycle.message_event.set()
         if self.flow is not None:
@@ -136,32 +111,23 @@ class H11Protocol(asyncio.Protocol):
             self.timeout_keep_alive_task.cancel()
             self.timeout_keep_alive_task = None
 
-    def _get_upgrade(self) -> bytes | None:
-        connection = []
-        upgrade = None
-        for name, value in self.headers:
-            if name == b"connection":
-                connection = [token.lower().strip() for token in value.split(b",")]
-            if name == b"upgrade":
-                upgrade = value.lower()
-        if b"upgrade" in connection:
-            return upgrade
-        return None
-
     def _should_upgrade_to_ws(self) -> bool:
         if self.ws_protocol_class is None:
             return False
         return True
 
     def _unsupported_upgrade_warning(self) -> None:
-        msg = "Unsupported upgrade request."
-        self.logger.warning(msg)
+        self.logger.warning("Unsupported upgrade request.")
         if not self._should_upgrade_to_ws():
-            msg = "No supported WebSocket library detected. Please use \"pip install 'uvicorn[standard]'\", or install 'websockets' or 'wsproto' manually."  # noqa: E501
-            self.logger.warning(msg)
+            self.logger.warning(
+                "No supported WebSocket library detected. "
+                "Please use \"pip install 'uvicorn[standard]'\", or install 'websockets' or 'wsproto' manually."
+            )
 
     def _should_upgrade(self) -> bool:
-        upgrade = self._get_upgrade()
+        upgrade = self.conn.upgrade()
+        if upgrade is not None:
+            upgrade = upgrade.lower()
         if upgrade == b"websocket" and self._should_upgrade_to_ws():
             return True
         if upgrade is not None:
@@ -170,40 +136,24 @@ class H11Protocol(asyncio.Protocol):
 
     def data_received(self, data: bytes) -> None:
         self._unset_keepalive_if_required()
+        try:
+            self.handle_events(self.conn.receive_event(data))
+        except zttp.RemoteProtocolError:
+            self.handle_remote_protocol_error()
 
-        self.conn.receive_data(data)
-        self.handle_events()
-
-    def handle_events(self) -> None:
-        while True:
-            try:
-                event = self.conn.next_event()
-            except h11.RemoteProtocolError:
-                msg = "Invalid HTTP request received."
-                self.logger.warning(msg)
-                self.send_400_response(msg)
-                return
-
-            if event is h11.NEED_DATA:
-                break
-
-            elif event is h11.PAUSED:
-                # This case can occur in HTTP pipelining, so we need to
-                # stop reading any more data, and ensure that at the end
-                # of the active request/response cycle we handle any
-                # events that have been buffered up.
-                self.flow.pause_reading()
-                break
-
-            elif isinstance(event, h11.Request):
+    def handle_events(self, event: zttp.Event) -> None:
+        while event is not zttp.NEED_DATA:
+            if isinstance(event, zttp.Request):
                 # Pipelined HTTP requests and WebSocket upgrades may be processed after the keep-alive timer is armed.
                 self._unset_keepalive_if_required()
 
-                self.headers = [(key.lower(), value) for key, value in event.headers]
-                raw_path, _, query_string = event.target.partition(b"?")
-                path = unquote(raw_path.decode("ascii"))
+                assert isinstance(event.headers, zttp.HeaderBlock)
+                self.headers = event.headers.to_list(lowercase_names=True)
+                path = event.path.decode("ascii")
+                if "%" in path:
+                    path = unquote(path)
                 full_path = self.root_path + path
-                full_raw_path = self.root_path.encode("ascii") + raw_path
+                full_raw_path = self.root_path.encode("ascii") + event.path
                 self.scope = {
                     "type": "http",
                     "asgi": {"version": self.asgi_version, "spec_version": "2.3"},
@@ -215,7 +165,7 @@ class H11Protocol(asyncio.Protocol):
                     "root_path": self.root_path,
                     "path": full_path,
                     "raw_path": full_raw_path,
-                    "query_string": query_string,
+                    "query_string": event.query,
                     "headers": self.headers,
                     "state": self.app_state.copy(),
                 }
@@ -243,71 +193,70 @@ class H11Protocol(asyncio.Protocol):
                     access_log=self.access_log,
                     default_headers=self.server_state.default_headers,
                     message_event=asyncio.Event(),
+                    expect_100_continue=event.expect_continue,
                     on_response=self.on_response_complete,
                 )
+                if event.end_stream:
+                    self.cycle.more_body = False
+                    self.cycle.message_event.set()
                 if self.config.reset_contextvars:
-                    # Opt-in workaround for https://github.com/python/cpython/issues/140947:
-                    # asyncio can leak context vars between tasks. Hides context set in the
-                    # lifespan or by external instrumentation.
                     task = self.loop.create_task(self.cycle.run_asgi(app), context=contextvars.Context())
                 else:
                     task = self.loop.create_task(self.cycle.run_asgi(app))
                 task.add_done_callback(self.tasks.discard)
                 self.tasks.add(task)
 
-            elif isinstance(event, h11.Data):
-                if self.conn.our_state is h11.DONE:
-                    continue
-                self.cycle.body += event.data
-                if len(self.cycle.body) > HIGH_WATER_LIMIT:
-                    self.flow.pause_reading()
-                self.cycle.message_event.set()
+            elif isinstance(event, zttp.Data):
+                if self.cycle is not None and not self.cycle.response_complete:
+                    self.cycle.body += event.data
+                    if len(self.cycle.body) > HIGH_WATER_LIMIT:
+                        self.flow.pause_reading()
+                    self.cycle.message_event.set()
 
-            elif isinstance(event, h11.EndOfMessage):
-                if self.conn.our_state is h11.DONE:
-                    self.transport.resume_reading()
-                    self.conn.start_next_cycle()
-                    continue
-                self.cycle.more_body = False
-                self.cycle.message_event.set()
-                if self.conn.their_state == h11.MUST_CLOSE:
-                    break
+            elif isinstance(event, zttp.EndOfMessage):
+                if self.cycle is not None:
+                    self.cycle.more_body = False
+                    self.cycle.message_event.set()
+                    if self.cycle.response_complete:
+                        self.conn.start_next_cycle()
 
-    def handle_websocket_upgrade(self, event: h11.Request) -> None:
-        if self.logger.level <= TRACE_LOG_LEVEL:  # pragma: full coverage
+            event = self.conn.next_event()
+
+    def handle_remote_protocol_error(self) -> None:
+        msg = "Invalid HTTP request received."
+        self.logger.warning(msg)
+        self.send_400_response(msg)
+
+    def handle_websocket_upgrade(self, event: zttp.Request) -> None:
+        if self.logger.level <= TRACE_LOG_LEVEL:  # pragma: no cover
             prefix = "%s:%d - " % self.client if self.client else ""
             self.logger.log(TRACE_LOG_LEVEL, "%sUpgrading to WebSocket", prefix)
 
         self.connections.discard(self)
-        output = [event.method, b" ", event.target, b" HTTP/1.1\r\n"]
+        output = bytearray(event.method + b" " + event.target + b" HTTP/1.1\r\n")
         for name, value in self.headers:
-            output += [name, b": ", value, b"\r\n"]
-        output.append(b"\r\n")
+            output += name + b": " + value + b"\r\n"
+        output += b"\r\n"
         protocol = self.ws_protocol_class(  # type: ignore[call-arg, misc]
             config=self.config,
             server_state=self.server_state,
             app_state=self.app_state,
         )
         protocol.connection_made(self.transport)
-        protocol.data_received(b"".join(output))
+        protocol.data_received(bytes(output))
         self.transport.set_protocol(protocol)
 
     def send_400_response(self, msg: str) -> None:
-        reason = STATUS_PHRASES[400]
+        body = msg.encode("ascii")
         headers: list[tuple[bytes, bytes]] = [
             (b"content-type", b"text/plain; charset=utf-8"),
+            (b"content-length", str(len(body)).encode("ascii")),
             (b"connection", b"close"),
         ]
-        event = h11.Response(status_code=400, headers=headers, reason=reason)
-        output = self.conn.send(event)
-        self.transport.write(output)
-
-        output = self.conn.send(event=h11.Data(data=msg.encode("ascii")))
-        self.transport.write(output)
-
-        output = self.conn.send(event=h11.EndOfMessage())
-        self.transport.write(output)
-
+        self.conn.send_response(400, headers)
+        self.conn.send_data(body)
+        self.conn.end_message()
+        self.transport.write(self.conn.data_to_send())
         self.transport.close()
 
     def on_response_complete(self) -> None:
@@ -324,18 +273,21 @@ class H11Protocol(asyncio.Protocol):
         # Unpause data reads if needed.
         self.flow.resume_reading()
 
-        # Unblock any pipelined events.
-        if self.conn.our_state is h11.DONE and self.conn.their_state is h11.DONE:
+        # Do not reset the parser until the complete request body has arrived.
+        # An application may respond before consuming it; any remaining body
+        # still belongs to the current request and must be discarded as such.
+        if self.cycle is not None and not self.cycle.more_body:
             self.conn.start_next_cycle()
-            self.handle_events()
+            try:
+                self.handle_events(self.conn.next_event())
+            except zttp.RemoteProtocolError:  # pragma: no cover
+                self.handle_remote_protocol_error()
 
     def shutdown(self) -> None:
         """
         Called by the server to commence a graceful shutdown.
         """
         if self.cycle is None or self.cycle.response_complete:
-            event = h11.ConnectionClosed()
-            self.conn.send(event)
             self.transport.close()
         else:
             self.cycle.keep_alive = False
@@ -344,13 +296,13 @@ class H11Protocol(asyncio.Protocol):
         """
         Called by the transport when the write buffer exceeds the high water mark.
         """
-        self.flow.pause_writing()  # pragma: full coverage
+        self.flow.pause_writing()  # pragma: no cover
 
     def resume_writing(self) -> None:
         """
         Called by the transport when the write buffer drops below the low water mark.
         """
-        self.flow.resume_writing()  # pragma: full coverage
+        self.flow.resume_writing()  # pragma: no cover
 
     def timeout_keep_alive_handler(self) -> None:
         """
@@ -358,8 +310,6 @@ class H11Protocol(asyncio.Protocol):
         delay.
         """
         if not self.transport.is_closing():
-            event = h11.ConnectionClosed()
-            self.conn.send(event)
             self.transport.close()
 
 
@@ -367,7 +317,7 @@ class RequestResponseCycle:
     def __init__(
         self,
         scope: HTTPScope,
-        conn: h11.Connection,
+        conn: zttp.H1Connection,
         transport: asyncio.Transport,
         flow: FlowControl,
         logger: logging.Logger,
@@ -375,6 +325,7 @@ class RequestResponseCycle:
         access_log: bool,
         default_headers: list[tuple[bytes, bytes]],
         message_event: asyncio.Event,
+        expect_100_continue: bool,
         on_response: Callable[..., None],
     ) -> None:
         self.scope = scope
@@ -391,7 +342,7 @@ class RequestResponseCycle:
         # Connection state
         self.disconnected = False
         self.keep_alive = True
-        self.waiting_for_100_continue = conn.they_are_waiting_for_100_continue
+        self.waiting_for_100_continue = expect_100_continue
 
         # Request state
         self.body = bytearray()
@@ -400,6 +351,9 @@ class RequestResponseCycle:
         # Response state
         self.response_started = False
         self.response_complete = False
+        self.bodyless = False
+        self.chunked_encoding = False
+        self.expected_content_length = 0
 
     # ASGI exception wrapper
     async def run_asgi(self, app: ASGI3Application) -> None:
@@ -450,10 +404,10 @@ class RequestResponseCycle:
     # ASGI interface
     async def send(self, message: ASGISendEvent) -> None:
         if self.flow.write_paused and not self.disconnected:
-            await self.flow.drain()  # pragma: full coverage
+            await self.flow.drain()  # pragma: no cover
 
         if self.disconnected:
-            return  # pragma: full coverage
+            return  # pragma: no cover
 
         if not self.response_started:
             # Sending response status line and headers
@@ -466,8 +420,41 @@ class RequestResponseCycle:
             status = message["status"]
             headers = self.default_headers + list(message.get("headers", []))
 
-            if CLOSE_HEADER in self.scope["headers"] and CLOSE_HEADER not in headers:
-                headers = headers + [CLOSE_HEADER]
+            bodyless = self.scope["method"] == "HEAD" or status in (204, 304) or status < 200
+
+            # RFC 9112 §6.1 forbids Transfer-Encoding on 1xx and 204 responses, and
+            # zttp refuses to serialize one there, so drop it instead of erroring.
+            # HEAD and 304 may keep it: it describes the body a GET would return.
+            if status < 200 or status == 204:
+                headers = [(name, value) for name, value in headers if name.lower() != b"transfer-encoding"]
+
+            has_content_length = False
+            has_transfer_encoding = False
+            for name, value in headers:
+                name = name.lower()
+                if name == b"content-length":
+                    has_content_length = True
+                    self.expected_content_length = int(value.decode())
+                elif name == b"transfer-encoding":
+                    # zttp only accepts a sole, final `chunked` coding - anything
+                    # else raises, like h11 - and it frames the body itself, so
+                    # there is no Content-Length accounting to do here.
+                    has_transfer_encoding = True
+                    self.chunked_encoding = True
+
+            # A response carrying both Content-Length and Transfer-Encoding is
+            # a framing conflict that zttp rejects, so drop the Content-Length.
+            if has_transfer_encoding and has_content_length:
+                headers = [(name, value) for name, value in headers if name.lower() != b"content-length"]
+                has_content_length = False
+                self.expected_content_length = 0
+
+            # zttp refuses to frame the body unless the response declares
+            # Content-Length or Transfer-Encoding, so add chunked encoding
+            # ourselves when the application provides neither.
+            if not bodyless and not has_transfer_encoding and not has_content_length:
+                self.chunked_encoding = True
+                headers = headers + [(b"transfer-encoding", b"chunked")]
 
             if self.access_log:
                 self.access_logger.info(
@@ -480,10 +467,9 @@ class RequestResponseCycle:
                 )
 
             # Write response status line and headers
-            reason = STATUS_PHRASES[status]
-            response = h11.Response(status_code=status, headers=headers, reason=reason)
-            output = self.conn.send(event=response)
-            self.transport.write(output)
+            self.bodyless = bodyless
+            self.conn.send_response(status, headers)
+            self.transport.write(self.conn.data_to_send())
 
         elif not self.response_complete:
             # Sending response body
@@ -494,33 +480,44 @@ class RequestResponseCycle:
             more_body = message.get("more_body", False)
 
             # Write response body
-            data = b"" if self.scope["method"] == "HEAD" else body
-            output = self.conn.send(event=h11.Data(data=data))
-            self.transport.write(output)
+            if self.bodyless:
+                self.expected_content_length = 0
+            elif self.chunked_encoding:
+                if body:
+                    self.conn.send_data(body)
+                    self.transport.write(self.conn.data_to_send())
+            else:
+                if len(body) > self.expected_content_length:
+                    raise RuntimeError("Response content longer than Content-Length")
+                self.expected_content_length -= len(body)
+                if body:
+                    self.conn.send_data(body)
+                    self.transport.write(self.conn.data_to_send())
 
             # Handle response completion
             if not more_body:
+                if self.expected_content_length != 0:
+                    raise RuntimeError("Response content shorter than Content-Length")
                 self.response_complete = True
                 self.message_event.set()
-                output = self.conn.send(event=h11.EndOfMessage())
-                self.transport.write(output)
+                self.conn.end_message()
+                self.transport.write(self.conn.data_to_send())
 
         else:
             # Response already sent
             raise RuntimeError(f"Unexpected ASGI message '{message['type']}' sent, after response already completed.")
 
         if self.response_complete:
-            if self.conn.our_state is h11.MUST_CLOSE or not self.keep_alive:
-                self.conn.send(event=h11.ConnectionClosed())
+            # `should_close()` covers both directions: the request's `Connection: close`
+            # or HTTP/1.0 default, and a `close` the response we just wrote declared.
+            if not self.keep_alive or self.conn.should_close():
                 self.transport.close()
             self.on_response()
 
     async def receive(self) -> ASGIReceiveEvent:
         if self.waiting_for_100_continue and not self.transport.is_closing():
-            headers: list[tuple[str, str]] = []
-            event = h11.InformationalResponse(status_code=100, headers=headers, reason="Continue")
-            output = self.conn.send(event=event)
-            self.transport.write(output)
+            self.conn.send_informational(100)
+            self.transport.write(self.conn.data_to_send())
             self.waiting_for_100_continue = False
 
         if not self.disconnected and not self.response_complete:

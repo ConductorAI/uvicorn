@@ -20,7 +20,7 @@ from pytest_mock import MockerFixture
 from tests.custom_loop_utils import CustomLoop
 from tests.utils import as_cwd, get_asyncio_default_loop_per_os
 from uvicorn._types import ASGIApplication, ASGIReceiveCallable, ASGISendCallable, Environ, Scope, StartResponse
-from uvicorn.config import Config, LoopFactoryType
+from uvicorn.config import Config, LoopFactoryType, UvicornDeprecationWarning
 from uvicorn.middleware.proxy_headers import ProxyHeadersMiddleware
 from uvicorn.middleware.wsgi import WSGIMiddleware
 from uvicorn.protocols.http.h11_impl import H11Protocol
@@ -254,6 +254,12 @@ def test_concrete_http_class() -> None:
     assert config.http_protocol_class is H11Protocol
 
 
+def test_http2_requires_zttp_protocol() -> None:
+    config = Config(app=asgi_app, http="h11", http2=True)
+    with pytest.raises(ValueError, match="HTTP/2 requires the `zttp` HTTP protocol"):
+        config.load()
+
+
 def test_socket_bind() -> None:
     config = Config(app=asgi_app)
     config.load()
@@ -416,11 +422,19 @@ def web_concurrency(request: pytest.FixtureRequest) -> Iterator[int]:
         del os.environ["WEB_CONCURRENCY"]
 
 
-@pytest.fixture(params=["127.0.0.1", "127.0.0.2"])
+@pytest.fixture(params=["::1", "127.0.0.1", "127.0.0.2"])
 def forwarded_allow_ips(request: pytest.FixtureRequest) -> Iterator[str]:
     yield request.param
     if os.getenv("FORWARDED_ALLOW_IPS"):
         del os.environ["FORWARDED_ALLOW_IPS"]
+
+
+def test_forwarded_allow_ips_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("FORWARDED_ALLOW_IPS", raising=False)
+
+    config = Config(app=asgi_app)
+
+    assert config.forwarded_allow_ips == "127.0.0.1,::1"
 
 
 def test_env_file(
@@ -498,6 +512,14 @@ def test_config_log_level_case_insensitive(log_level: str) -> None:
     assert logging.getLogger("uvicorn.error").level == logging.INFO
 
 
+@pytest.mark.filterwarnings("ignore: websockets.legacy is deprecated.*:DeprecationWarning")
+def test_ws_websockets_emits_deprecation_warning() -> None:
+    sys.modules.pop("uvicorn.protocols.websockets.websockets_impl", None)
+    config = Config(app=asgi_app, ws="websockets")
+    with pytest.warns(UvicornDeprecationWarning, match="The `websockets` implementation is deprecated"):
+        config.load()
+
+
 def test_ws_max_size() -> None:
     config = Config(app=asgi_app, ws_max_size=1000)
     config.load()
@@ -551,6 +573,37 @@ def test_bind_fd_works_with_reload_or_workers(reload: bool, workers: int):  # pr
     assert sock.getsockname() == ""
     sock.close()
     fdsock.close()
+
+
+@pytest.fixture
+def stdin_socket() -> Iterator[socket.socket]:  # pragma: py-win32
+    with closing(socket.socket(socket.AF_INET)) as sock:
+        sock.bind(("127.0.0.1", 0))
+        saved_stdin = os.dup(0)
+        os.dup2(sock.fileno(), 0)
+        try:
+            yield sock
+        finally:
+            os.dup2(saved_stdin, 0)
+            os.close(saved_stdin)
+
+
+@pytest.mark.parametrize(
+    "reload, workers",
+    [
+        (True, 1),
+        (False, 2),
+    ],
+    ids=["--reload=True --workers=1", "--reload=False --workers=2"],
+)
+@pytest.mark.skipif(sys.platform == "win32", reason="require unix-like system")
+def test_bind_stdin_works_with_reload_or_workers(
+    reload: bool, workers: int, stdin_socket: socket.socket
+):  # pragma: py-win32
+    config = Config(app=asgi_app, fd=0, reload=reload, workers=workers)
+    config.load()
+    with closing(config.bind_socket()) as sock:
+        assert sock.getsockname() == stdin_socket.getsockname()
 
 
 @pytest.mark.parametrize(
